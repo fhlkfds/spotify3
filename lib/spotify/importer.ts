@@ -1,7 +1,7 @@
 import { Prisma } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
-import { spotifyRequest } from "@/lib/spotify/client";
+import { SpotifyApiError, spotifyRequest } from "@/lib/spotify/client";
 import type {
   SpotifyArtistsResponse,
   SpotifyAudioFeaturesResponse,
@@ -19,6 +19,13 @@ type ImportSummary = {
   rateLimitedHits: number;
   message: string;
 };
+
+type AudioFeatureEnrichmentSummary = {
+  updatedCount: number;
+  skippedCount: number;
+};
+
+const SPOTIFY_ID_REGEX = /^[A-Za-z0-9]{22}$/;
 
 function chunk<T>(input: T[], size: number): T[][] {
   const output: T[][] = [];
@@ -221,38 +228,110 @@ async function enrichAudioFeatures(
   userId: string,
   trackIds: string[],
   onRateLimit: () => Promise<void>,
-): Promise<void> {
-  for (const ids of chunk(trackIds, 100)) {
+): Promise<AudioFeatureEnrichmentSummary> {
+  const uniqueTrackIds = [...new Set(trackIds)];
+  const validTrackIds = uniqueTrackIds.filter((id) => SPOTIFY_ID_REGEX.test(id));
+
+  let updatedCount = 0;
+  let skippedCount = uniqueTrackIds.length - validTrackIds.length;
+
+  for (const ids of chunk(validTrackIds, 50)) {
     if (ids.length === 0) {
       continue;
     }
 
-    const payload = await spotifyRequest<SpotifyAudioFeaturesResponse>(
-      userId,
-      `/audio-features?ids=${ids.join(",")}`,
-      undefined,
-      {
-        maxRetries: 5,
-        onRateLimit,
-      },
-    );
+    try {
+      const payload = await spotifyRequest<SpotifyAudioFeaturesResponse>(
+        userId,
+        `/audio-features?ids=${ids.join(",")}`,
+        undefined,
+        {
+          maxRetries: 5,
+          onRateLimit,
+        },
+      );
 
-    for (const feature of payload.audio_features) {
-      if (!feature) {
-        continue;
+      for (const feature of payload.audio_features) {
+        if (!feature) {
+          skippedCount += 1;
+          continue;
+        }
+
+        const updated = await prisma.track.updateMany({
+          where: { id: feature.id },
+          data: {
+            danceability: feature.danceability,
+            energy: feature.energy,
+            valence: feature.valence,
+            tempo: feature.tempo,
+          },
+        });
+
+        if (updated.count > 0) {
+          updatedCount += 1;
+        } else {
+          skippedCount += 1;
+        }
+      }
+    } catch (error) {
+      // Some IDs in a batch can fail audio-features lookup. Fallback to single-track lookups
+      // so one invalid/non-track ID does not fail the entire import.
+      for (const trackId of ids) {
+        try {
+          const singlePayload = await spotifyRequest<SpotifyAudioFeaturesResponse>(
+            userId,
+            `/audio-features?ids=${trackId}`,
+            undefined,
+            {
+              maxRetries: 2,
+              onRateLimit,
+            },
+          );
+
+          const feature = singlePayload.audio_features[0];
+          if (!feature) {
+            skippedCount += 1;
+            continue;
+          }
+
+          const updated = await prisma.track.updateMany({
+            where: { id: feature.id },
+            data: {
+              danceability: feature.danceability,
+              energy: feature.energy,
+              valence: feature.valence,
+              tempo: feature.tempo,
+            },
+          });
+
+          if (updated.count > 0) {
+            updatedCount += 1;
+          } else {
+            skippedCount += 1;
+          }
+        } catch (singleError) {
+          if (singleError instanceof SpotifyApiError) {
+            console.warn(
+              `[Import] Skipping audio features for track ${trackId} (status ${singleError.status})`,
+            );
+          } else {
+            console.warn(`[Import] Skipping audio features for track ${trackId}`);
+          }
+          skippedCount += 1;
+        }
       }
 
-      await prisma.track.update({
-        where: { id: feature.id },
-        data: {
-          danceability: feature.danceability,
-          energy: feature.energy,
-          valence: feature.valence,
-          tempo: feature.tempo,
-        },
-      });
+      if (error instanceof SpotifyApiError) {
+        console.warn(
+          `[Import] Audio feature batch failed with status ${error.status}; continued with fallback`,
+        );
+      } else {
+        console.warn("[Import] Audio feature batch failed; continued with fallback");
+      }
     }
   }
+
+  return { updatedCount, skippedCount };
 }
 
 async function storePlayEvents(userId: string, items: SpotifyRecentlyPlayedItem[]): Promise<number> {
@@ -340,9 +419,16 @@ export async function runSpotifyImport(userId: string, importRunId: string): Pro
     });
 
     await enrichArtists(userId, [...artistIdSet], onRateLimit);
-    await enrichAudioFeatures(userId, importedTrackIds, onRateLimit);
+    const audioFeatureSummary = await enrichAudioFeatures(userId, importedTrackIds, onRateLimit);
 
     const importedPlays = await storePlayEvents(userId, recentlyPlayed);
+
+    const audioFeaturesNote =
+      audioFeatureSummary.skippedCount > 0
+        ? ` (audio features updated: ${audioFeatureSummary.updatedCount}, skipped: ${audioFeatureSummary.skippedCount})`
+        : "";
+
+    const completionMessage = `Import completed${audioFeaturesNote}`;
 
     await prisma.user.update({
       where: { id: userId },
@@ -350,8 +436,8 @@ export async function runSpotifyImport(userId: string, importRunId: string): Pro
         lastImportAt: new Date(),
         lastImportStatus:
           rateLimitedHits > 0
-            ? `Import completed with ${rateLimitedHits} rate-limit retries`
-            : "Import completed",
+            ? `${completionMessage} with ${rateLimitedHits} rate-limit retries`
+            : completionMessage,
       },
     });
 
@@ -362,7 +448,7 @@ export async function runSpotifyImport(userId: string, importRunId: string): Pro
         importedPlays,
         importedTracks: importedTrackIds.length,
         rateLimitedHits,
-        message: "Import completed",
+        message: completionMessage,
         finishedAt: new Date(),
       },
     });
@@ -372,7 +458,7 @@ export async function runSpotifyImport(userId: string, importRunId: string): Pro
       importedPlays,
       importedTracks: importedTrackIds.length,
       rateLimitedHits,
-      message: "Import completed",
+      message: completionMessage,
     };
   } catch (error) {
     const message =
