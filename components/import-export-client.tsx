@@ -23,6 +23,8 @@ type ImportStatusResponse = {
   lastImportStatus: string | null;
 };
 
+const MAX_JSON_IMPORT_BYTES = 200 * 1024 * 1024;
+
 export function ImportExportClient() {
   const [status, setStatus] = useState<ImportStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -88,18 +90,25 @@ export function ImportExportClient() {
       return;
     }
 
+    if (file.size > MAX_JSON_IMPORT_BYTES) {
+      toast({
+        title: "File too large",
+        description: "JSON import file must be 200MB or smaller.",
+        variant: "destructive",
+      });
+      event.target.value = "";
+      return;
+    }
+
     setRestoring(true);
 
     try {
-      const text = await file.text();
-      const payload = JSON.parse(text);
+      const formData = new FormData();
+      formData.append("file", file);
 
       const response = await fetch("/api/import/json", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
+        body: formData,
       });
 
       if (!response.ok) {
@@ -182,7 +191,9 @@ export function ImportExportClient() {
       <Card className="xl:col-span-2">
         <CardHeader>
           <CardTitle>Restore from JSON</CardTitle>
-          <CardDescription>Import a previously exported JSON payload into your local DB.</CardDescription>
+          <CardDescription>
+            Import a previously exported JSON payload into your local DB (max 200MB).
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <Input type="file" accept="application/json" onChange={onRestoreFile} disabled={restoring} />

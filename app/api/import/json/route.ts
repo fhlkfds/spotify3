@@ -5,6 +5,10 @@ import { z } from "zod";
 import { getCurrentUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/prisma";
 
+export const runtime = "nodejs";
+
+const MAX_JSON_IMPORT_BYTES = 200 * 1024 * 1024;
+
 const restoreSchema = z.object({
   albums: z
     .array(
@@ -54,6 +58,57 @@ const restoreSchema = z.object({
     .default([]),
 });
 
+class RequestTooLargeError extends Error {}
+
+function getContentLength(request: NextRequest): number | null {
+  const value = request.headers.get("content-length");
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isMultipartRequest(request: NextRequest): boolean {
+  const contentType = request.headers.get("content-type");
+  return Boolean(contentType && contentType.includes("multipart/form-data"));
+}
+
+async function readImportPayload(request: NextRequest): Promise<unknown> {
+  const contentLength = getContentLength(request);
+  if (contentLength !== null && contentLength > MAX_JSON_IMPORT_BYTES) {
+    throw new RequestTooLargeError("Payload exceeds 200MB");
+  }
+
+  if (isMultipartRequest(request)) {
+    const formData = await request.formData();
+    const file = formData.get("file");
+
+    if (!(file instanceof File)) {
+      throw new Error("Missing JSON file");
+    }
+
+    if (file.size > MAX_JSON_IMPORT_BYTES) {
+      throw new RequestTooLargeError("Payload exceeds 200MB");
+    }
+
+    const text = await file.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_JSON_IMPORT_BYTES) {
+      throw new RequestTooLargeError("Payload exceeds 200MB");
+    }
+
+    return JSON.parse(text);
+  }
+
+  const text = await request.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_JSON_IMPORT_BYTES) {
+    throw new RequestTooLargeError("Payload exceeds 200MB");
+  }
+
+  return JSON.parse(text);
+}
+
 export async function POST(request: NextRequest): Promise<NextResponse> {
   const user = await getCurrentUser();
 
@@ -61,7 +116,28 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const payload = await request.json();
+  let payload: unknown;
+  try {
+    payload = await readImportPayload(request);
+  } catch (error) {
+    if (error instanceof RequestTooLargeError) {
+      return NextResponse.json(
+        { error: "Import file too large. Maximum size is 200MB." },
+        { status: 413 },
+      );
+    }
+
+    if (error instanceof SyntaxError) {
+      return NextResponse.json({ error: "Invalid JSON file" }, { status: 400 });
+    }
+
+    if (error instanceof Error && error.message === "Missing JSON file") {
+      return NextResponse.json({ error: "Missing JSON file upload" }, { status: 400 });
+    }
+
+    return NextResponse.json({ error: "Invalid restore payload" }, { status: 400 });
+  }
+
   const parsed = restoreSchema.safeParse(payload);
 
   if (!parsed.success) {
