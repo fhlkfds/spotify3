@@ -1,0 +1,163 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String       @id @default(cuid())
+  spotifyId        String       @unique @map("spotify_id")
+  email            String?      @unique
+  displayName      String?      @map("display_name")
+  image            String?
+  lastImportAt     DateTime?    @map("last_import_at")
+  lastImportStatus String?      @map("last_import_status")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+  tokens           Token[]
+  sessions         Session[]
+  playEvents       PlayEvent[]
+  dailyRecRuns     DailyRecRun[]
+  importRuns       ImportRun[]
+
+  @@index([spotifyId])
+  @@map("users")
+}
+
+model Token {
+  id           String   @id @default(cuid())
+  userId       String   @unique @map("user_id")
+  accessToken  String   @map("access_token")
+  refreshToken String   @map("refresh_token")
+  expiresAt    DateTime @map("expires_at")
+  scope        String
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("tokens")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  sessionToken String   @unique @map("session_token")
+  expiresAt    DateTime @map("expires_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model Album {
+  id          String   @id
+  name        String
+  releaseDate String?  @map("release_date")
+  imageUrl    String?  @map("image_url")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  tracks      Track[]
+
+  @@map("albums")
+}
+
+model Artist {
+  id        String        @id
+  name      String
+  imageUrl  String?       @map("image_url")
+  genres    String[]      @default([])
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+  tracks    TrackArtist[]
+
+  @@index([name])
+  @@map("artists")
+}
+
+model Track {
+  id           String        @id
+  name         String
+  durationMs   Int           @map("duration_ms")
+  albumId      String?       @map("album_id")
+  artistIds    String[]      @default([]) @map("artist_ids")
+  popularity   Int?
+  previewUrl   String?       @map("preview_url")
+  imageUrl     String?       @map("image_url")
+  danceability Float?
+  energy       Float?
+  valence      Float?
+  tempo        Float?
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  album        Album?        @relation(fields: [albumId], references: [id], onDelete: SetNull)
+  artists      TrackArtist[]
+  playEvents   PlayEvent[]
+
+  @@index([albumId])
+  @@index([name])
+  @@map("tracks")
+}
+
+model TrackArtist {
+  trackId  String @map("track_id")
+  artistId String @map("artist_id")
+  track    Track  @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  artist   Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+
+  @@id([trackId, artistId])
+  @@index([trackId])
+  @@index([artistId])
+  @@map("track_artists")
+}
+
+model PlayEvent {
+  id           String   @id @default(cuid())
+  userId       String   @map("user_id")
+  trackId      String   @map("track_id")
+  playedAt     DateTime @map("played_at")
+  importSource String?  @map("import_source")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  track        Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, trackId, playedAt])
+  @@index([userId, playedAt])
+  @@index([trackId])
+  @@index([userId, trackId])
+  @@map("play_events")
+}
+
+model DailyRecRun {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  date      DateTime
+  tracks    Json
+  albums    Json
+  rationale Json
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([userId, date])
+  @@map("daily_rec_runs")
+}
+
+model ImportRun {
+  id              String    @id @default(cuid())
+  userId          String    @map("user_id")
+  status          String
+  message         String?
+  importedPlays   Int       @default(0) @map("imported_plays")
+  importedTracks  Int       @default(0) @map("imported_tracks")
+  rateLimitedHits Int       @default(0) @map("rate_limited_hits")
+  startedAt       DateTime  @default(now()) @map("started_at")
+  finishedAt      DateTime? @map("finished_at")
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, startedAt])
+  @@map("import_runs")
+}
