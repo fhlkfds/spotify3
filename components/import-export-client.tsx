@@ -30,6 +30,7 @@ export function ImportExportClient() {
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
   const [restoring, setRestoring] = useState(false);
+  const [restoreFile, setRestoreFile] = useState<File | null>(null);
 
   const refreshStatus = useCallback(async () => {
     const response = await fetch("/api/import/status", { cache: "no-store" });
@@ -84,9 +85,10 @@ export function ImportExportClient() {
     await refreshStatus();
   };
 
-  const onRestoreFile = async (event: ChangeEvent<HTMLInputElement>) => {
+  const onRestoreFileSelected = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) {
+      setRestoreFile(null);
       return;
     }
 
@@ -97,6 +99,20 @@ export function ImportExportClient() {
         variant: "destructive",
       });
       event.target.value = "";
+      setRestoreFile(null);
+      return;
+    }
+
+    setRestoreFile(file);
+  };
+
+  const startRestoreFromFile = async () => {
+    if (!restoreFile) {
+      toast({
+        title: "No file selected",
+        description: "Choose a JSON file to import.",
+        variant: "destructive",
+      });
       return;
     }
 
@@ -104,7 +120,7 @@ export function ImportExportClient() {
 
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("file", restoreFile);
 
       const response = await fetch("/api/import/json", {
         method: "POST",
@@ -118,10 +134,11 @@ export function ImportExportClient() {
 
       toast({
         title: "JSON restore complete",
-        description: "Database restored from export payload.",
+        description: `Imported ${restoreFile.name} successfully.`,
       });
 
       await refreshStatus();
+      setRestoreFile(null);
     } catch (error) {
       toast({
         title: "JSON restore failed",
@@ -130,7 +147,6 @@ export function ImportExportClient() {
       });
     } finally {
       setRestoring(false);
-      event.target.value = "";
     }
   };
 
@@ -190,13 +206,26 @@ export function ImportExportClient() {
 
       <Card className="xl:col-span-2">
         <CardHeader>
-          <CardTitle>Restore from JSON</CardTitle>
+          <CardTitle>Import from File</CardTitle>
           <CardDescription>
-            Import a previously exported JSON payload into your local DB (max 200MB).
+            File import options: JSON backup restore (max 200MB).
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <Input type="file" accept="application/json" onChange={onRestoreFile} disabled={restoring} />
+          <Input
+            type="file"
+            accept="application/json"
+            onChange={onRestoreFileSelected}
+            disabled={restoring}
+          />
+          {restoreFile ? (
+            <p className="text-xs text-zinc-400">
+              Selected: {restoreFile.name} ({(restoreFile.size / (1024 * 1024)).toFixed(2)} MB)
+            </p>
+          ) : null}
+          <Button onClick={startRestoreFromFile} disabled={!restoreFile || restoring}>
+            {restoring ? "Importing file..." : "Import File"}
+          </Button>
           <p className="text-xs text-zinc-500">
             Expected format: output from <code>/api/export/json</code>.
           </p>
