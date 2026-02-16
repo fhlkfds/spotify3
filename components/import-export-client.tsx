@@ -30,7 +30,7 @@ export function ImportExportClient() {
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
   const [restoring, setRestoring] = useState(false);
-  const [restoreFile, setRestoreFile] = useState<File | null>(null);
+  const [restoreFiles, setRestoreFiles] = useState<File[]>([]);
 
   const refreshStatus = useCallback(async () => {
     const response = await fetch("/api/import/status", { cache: "no-store" });
@@ -86,31 +86,32 @@ export function ImportExportClient() {
   };
 
   const onRestoreFileSelected = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) {
-      setRestoreFile(null);
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) {
+      setRestoreFiles([]);
       return;
     }
 
-    if (file.size > MAX_JSON_IMPORT_BYTES) {
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    if (totalBytes > MAX_JSON_IMPORT_BYTES) {
       toast({
         title: "File too large",
-        description: "JSON import file must be 200MB or smaller.",
+        description: "Total JSON import size must be 200MB or smaller.",
         variant: "destructive",
       });
       event.target.value = "";
-      setRestoreFile(null);
+      setRestoreFiles([]);
       return;
     }
 
-    setRestoreFile(file);
+    setRestoreFiles(files);
   };
 
   const startRestoreFromFile = async () => {
-    if (!restoreFile) {
+    if (restoreFiles.length === 0) {
       toast({
         title: "No file selected",
-        description: "Choose a JSON file to import.",
+        description: "Choose one or more JSON files to import.",
         variant: "destructive",
       });
       return;
@@ -120,7 +121,9 @@ export function ImportExportClient() {
 
     try {
       const formData = new FormData();
-      formData.append("file", restoreFile);
+      restoreFiles.forEach((file) => {
+        formData.append("files", file);
+      });
 
       const response = await fetch("/api/import/json", {
         method: "POST",
@@ -134,11 +137,14 @@ export function ImportExportClient() {
 
       toast({
         title: "JSON restore complete",
-        description: `Imported ${restoreFile.name} successfully.`,
+        description:
+          restoreFiles.length === 1
+            ? `Imported ${restoreFiles[0]?.name ?? "file"} successfully.`
+            : `Imported ${restoreFiles.length} files successfully.`,
       });
 
       await refreshStatus();
-      setRestoreFile(null);
+      setRestoreFiles([]);
     } catch (error) {
       toast({
         title: "JSON restore failed",
@@ -215,19 +221,26 @@ export function ImportExportClient() {
           <Input
             type="file"
             accept="application/json"
+            multiple
             onChange={onRestoreFileSelected}
             disabled={restoring}
           />
-          {restoreFile ? (
+          {restoreFiles.length > 0 ? (
             <p className="text-xs text-zinc-400">
-              Selected: {restoreFile.name} ({(restoreFile.size / (1024 * 1024)).toFixed(2)} MB)
+              Selected {restoreFiles.length} file{restoreFiles.length > 1 ? "s" : ""} (
+              {(
+                restoreFiles.reduce((sum, file) => sum + file.size, 0) /
+                (1024 * 1024)
+              ).toFixed(2)}{" "}
+              MB)
             </p>
           ) : null}
-          <Button onClick={startRestoreFromFile} disabled={!restoreFile || restoring}>
+          <Button onClick={startRestoreFromFile} disabled={restoreFiles.length === 0 || restoring}>
             {restoring ? "Importing file..." : "Import File"}
           </Button>
           <p className="text-xs text-zinc-500">
-            Expected format: output from <code>/api/export/json</code>.
+            Accepted formats: this app&apos;s export JSON, plus <code>your_spotify</code> privacy and
+            full-privacy JSON files.
           </p>
         </CardContent>
       </Card>
