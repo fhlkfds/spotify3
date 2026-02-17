@@ -12,6 +12,7 @@ export function DailyRecsClient() {
   const [data, setData] = useState<DailyRecommendations | null>(null);
   const [loading, setLoading] = useState(true);
   const [regenerating, setRegenerating] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -26,11 +27,14 @@ export function DailyRecsClient() {
       }
 
       if (!response.ok) {
+        const error = (await response.json().catch(() => null)) as { error?: string } | null;
+        const message = error?.error ?? "Failed to load recommendations.";
         toast({
           title: "Failed to load recommendations",
-          description: "Please import Spotify data first.",
+          description: message,
           variant: "destructive",
         });
+        setLoadError(message);
         setLoading(false);
         return;
       }
@@ -41,6 +45,7 @@ export function DailyRecsClient() {
       }
 
       setData(json);
+      setLoadError(null);
       setLoading(false);
     };
 
@@ -92,7 +97,7 @@ export function DailyRecsClient() {
     return (
       <Card>
         <CardContent className="p-6 text-sm text-zinc-400">
-          No recommendation data yet. Run an import first and return here.
+          {loadError ?? "No recommendation data yet. Run an import first and return here."}
         </CardContent>
       </Card>
     );

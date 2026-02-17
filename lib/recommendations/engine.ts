@@ -50,8 +50,15 @@ type CandidateWithScore = {
   score: number;
 };
 
-const DAY_MS = 24 * 60 * 60 * 1000;
 const REGENERATE_COOLDOWN_MS = 60 * 60 * 1000;
+
+type ListenedSeedRow = {
+  trackId: string;
+  track: {
+    albumId: string | null;
+    artistIds: string[];
+  };
+};
 
 function dateOnlyUtc(input: Date): Date {
   const copy = new Date(input);
@@ -116,9 +123,9 @@ async function getTasteSeedData(userId: string): Promise<{
   seedGenres: string[];
 }> {
   const allTimeRange: TimeRange = {
-    from: new Date(Date.now() - 365 * DAY_MS),
+    from: new Date(0),
     to: new Date(),
-    preset: "custom",
+    preset: "all",
   };
 
   const agg = await aggregateForRange(userId, allTimeRange);
@@ -141,6 +148,64 @@ async function getTasteSeedData(userId: string): Promise<{
   };
 }
 
+function dedupeStrings(values: string[]): string[] {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+    deduped.push(normalized);
+  }
+
+  return deduped;
+}
+
+function topValuesByFrequency(values: string[], maxSize: number): string[] {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, maxSize)
+    .map(([value]) => value);
+}
+
+function buildFallbackSeedsFromListening(rows: ListenedSeedRow[]): {
+  seedTrackIds: string[];
+  seedArtistIds: string[];
+} {
+  return {
+    seedTrackIds: topValuesByFrequency(rows.map((row) => row.trackId), 5),
+    seedArtistIds: topValuesByFrequency(rows.flatMap((row) => row.track.artistIds), 5),
+  };
+}
+
+async function getFallbackGenresFromArtists(artistIds: string[]): Promise<string[]> {
+  const dedupedArtistIds = dedupeStrings(artistIds);
+  if (dedupedArtistIds.length === 0) {
+    return [];
+  }
+
+  const artists = await prisma.artist.findMany({
+    where: { id: { in: dedupedArtistIds } },
+    select: {
+      genres: true,
+    },
+  });
+
+  return topValuesByFrequency(
+    artists.flatMap((artist) => artist.genres).filter((genre) => genre !== "Unknown"),
+    5,
+  );
+}
+
 async function fetchRecommendationCandidates(
   userId: string,
   profile: TasteProfile,
@@ -148,20 +213,33 @@ async function fetchRecommendationCandidates(
   seedArtists: string[],
   seedGenres: string[],
 ): Promise<SpotifyTrack[]> {
-  const seed_track_ids = seedTracks.slice(0, 2);
-  const seed_artist_ids = seedArtists.slice(0, 2);
-  const seed_genres = seedGenres.slice(0, 1);
+  const seedTrackIds = dedupeStrings(seedTracks).slice(0, 2);
+  const seedArtistIds = dedupeStrings(seedArtists).slice(0, 2);
+  const seedGenreValues = dedupeStrings(seedGenres).slice(0, 1);
+
+  if (seedTrackIds.length + seedArtistIds.length + seedGenreValues.length === 0) {
+    throw new Error("Not enough listening data to generate recommendations yet.");
+  }
 
   const params = new URLSearchParams({
     limit: "100",
-    seed_tracks: seed_track_ids.join(","),
-    seed_artists: seed_artist_ids.join(","),
-    seed_genres: seed_genres.join(","),
     target_energy: String(profile.energy),
     target_danceability: String(profile.danceability),
     target_valence: String(profile.valence),
     target_tempo: String(profile.tempo),
   });
+
+  if (seedTrackIds.length > 0) {
+    params.set("seed_tracks", seedTrackIds.join(","));
+  }
+
+  if (seedArtistIds.length > 0) {
+    params.set("seed_artists", seedArtistIds.join(","));
+  }
+
+  if (seedGenreValues.length > 0) {
+    params.set("seed_genres", seedGenreValues.join(","));
+  }
 
   const response = await spotifyRequest<SpotifyRecommendationsResponse>(
     userId,
@@ -169,6 +247,10 @@ async function fetchRecommendationCandidates(
     undefined,
     { maxRetries: 5 },
   );
+
+  if (response.tracks.length === 0) {
+    throw new Error("Spotify returned no recommendation candidates for your profile.");
+  }
 
   return response.tracks;
 }
@@ -298,24 +380,38 @@ export async function generateDailyRecommendations(
         track: {
           select: {
             albumId: true,
+            artistIds: true,
           },
         },
       },
     }),
   ]);
 
+  if (listenedRows.length === 0) {
+    throw new Error("No listening history found. Import Spotify data first.");
+  }
+
   const listenedTrackIds = new Set(listenedRows.map((row) => row.trackId));
   const listenedAlbumIds = new Set(listenedRows.map((row) => row.track.albumId).filter(Boolean) as string[]);
+  const fallbackSeeds = buildFallbackSeedsFromListening(listenedRows);
+
+  const seedTrackIds = dedupeStrings([...taste.seedTrackIds, ...fallbackSeeds.seedTrackIds]).slice(0, 5);
+  const seedArtistIds = dedupeStrings([...taste.seedArtistIds, ...fallbackSeeds.seedArtistIds]).slice(0, 5);
+  const seedGenres = taste.seedGenres.length ? taste.seedGenres : await getFallbackGenresFromArtists(seedArtistIds);
 
   const candidates = await fetchRecommendationCandidates(
     userId,
     taste.profile,
-    taste.seedTrackIds,
-    taste.seedArtistIds,
-    taste.seedGenres,
+    seedTrackIds,
+    seedArtistIds,
+    seedGenres,
   );
 
   const unseenTracks = filterNewToMeTracks(candidates, listenedTrackIds);
+
+  if (unseenTracks.length === 0) {
+    throw new Error("No new tracks available right now. Try regenerating later.");
+  }
 
   const candidateArtistIds = [
     ...new Set(unseenTracks.flatMap((track) => track.artists.map((artist) => artist.id))),
@@ -329,8 +425,8 @@ export async function generateDailyRecommendations(
     getArtistGenres(userId, candidateArtistIds),
   ]);
 
-  const knownArtistIds = new Set(taste.seedArtistIds);
-  const knownGenres = new Set(taste.seedGenres);
+  const knownArtistIds = new Set(seedArtistIds);
+  const knownGenres = new Set(seedGenres);
 
   const ranked = rankRecommendationCandidates(
     unseenTracks.map((track) => ({
@@ -352,7 +448,7 @@ export async function generateDailyRecommendations(
     imageUrl: row.track.album.images?.[0]?.url ?? null,
     previewUrl: row.track.preview_url ?? null,
     score: row.score,
-    reason: reasonForTrack(row.track, knownArtistIds, taste.seedGenres, candidateArtistGenres),
+    reason: reasonForTrack(row.track, knownArtistIds, seedGenres, candidateArtistGenres),
   }));
 
   const albumMap = new Map<string, DailyAlbumRec>();
@@ -371,7 +467,7 @@ export async function generateDailyRecommendations(
         row.track.artists.map((artist) => artist.name),
       imageUrl: row.track.album.images?.[0]?.url ?? null,
       score: row.score,
-      reason: reasonForTrack(row.track, knownArtistIds, taste.seedGenres, candidateArtistGenres),
+      reason: reasonForTrack(row.track, knownArtistIds, seedGenres, candidateArtistGenres),
     });
 
     if (albumMap.size >= 3) {
@@ -383,9 +479,9 @@ export async function generateDailyRecommendations(
 
   const rationale = {
     seeds: {
-      tracks: taste.seedTrackIds,
-      artists: taste.seedArtistIds,
-      genres: taste.seedGenres,
+      tracks: seedTrackIds,
+      artists: seedArtistIds,
+      genres: seedGenres,
     },
     profile: taste.profile,
   };
