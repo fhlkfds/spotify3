@@ -68,3 +68,9 @@ export type SpotifyRecommendationsResponse = {
 export type SpotifyRecommendationGenreSeedsResponse = {
   genres: string[];
 };
+
+export type SpotifySearchTracksResponse = {
+  tracks: {
+    items: SpotifyTrack[];
+  };
+};

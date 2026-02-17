@@ -7,6 +7,7 @@ import type {
   SpotifyAudioFeaturesResponse,
   SpotifyRecommendationGenreSeedsResponse,
   SpotifyRecommendationsResponse,
+  SpotifySearchTracksResponse,
   SpotifyTrack,
 } from "@/lib/spotify/types";
 
@@ -69,6 +70,8 @@ type SeedRequest = {
   label: string;
 };
 
+const SPOTIFY_ENTITY_ID_REGEX = /^[A-Za-z0-9]{22}$/;
+
 function dateOnlyUtc(input: Date): Date {
   const copy = new Date(input);
   copy.setUTCHours(0, 0, 0, 0);
@@ -129,6 +132,7 @@ async function getTasteSeedData(userId: string): Promise<{
   profile: TasteProfile;
   seedTrackIds: string[];
   seedArtistIds: string[];
+  seedArtistNames: string[];
   seedGenres: string[];
 }> {
   const allTimeRange: TimeRange = {
@@ -150,6 +154,7 @@ async function getTasteSeedData(userId: string): Promise<{
     profile,
     seedTrackIds: agg.songs.slice(0, 3).map((row) => row.id),
     seedArtistIds: agg.artists.slice(0, 3).map((row) => row.id),
+    seedArtistNames: agg.artists.slice(0, 5).map((row) => row.name),
     seedGenres: agg.genres
       .slice(0, 5)
       .map((row) => row.name)
@@ -172,6 +177,31 @@ function dedupeStrings(values: string[]): string[] {
   }
 
   return deduped;
+}
+
+function dedupeTracksById(tracks: SpotifyTrack[]): SpotifyTrack[] {
+  const map = new Map<string, SpotifyTrack>();
+  for (const track of tracks) {
+    map.set(track.id, track);
+  }
+  return [...map.values()];
+}
+
+function isSpotifyEntityId(value: string): boolean {
+  return SPOTIFY_ENTITY_ID_REGEX.test(value);
+}
+
+function clampNumber(value: number, min: number, max: number, fallback: number): number {
+  const finiteValue = Number.isFinite(value) ? value : fallback;
+  if (finiteValue < min) {
+    return min;
+  }
+
+  if (finiteValue > max) {
+    return max;
+  }
+
+  return finiteValue;
 }
 
 function sanitizeGenreToken(input: string): string {
@@ -230,12 +260,19 @@ function buildSeedStrategyKey(seedRequest: SeedRequest): string {
 }
 
 function buildRecommendationRequestParams(profile: TasteProfile, seedRequest: SeedRequest): URLSearchParams {
+  const normalizedProfile = {
+    energy: clampNumber(profile.energy, 0, 1, 0.5),
+    danceability: clampNumber(profile.danceability, 0, 1, 0.5),
+    valence: clampNumber(profile.valence, 0, 1, 0.5),
+    tempo: clampNumber(profile.tempo, 0, 250, 120),
+  };
+
   const params = new URLSearchParams({
     limit: "100",
-    target_energy: String(profile.energy),
-    target_danceability: String(profile.danceability),
-    target_valence: String(profile.valence),
-    target_tempo: String(profile.tempo),
+    target_energy: String(normalizedProfile.energy),
+    target_danceability: String(normalizedProfile.danceability),
+    target_valence: String(normalizedProfile.valence),
+    target_tempo: String(normalizedProfile.tempo),
   });
 
   if (seedRequest.seedTracks.length > 0) {
@@ -280,6 +317,104 @@ function filterSupportedGenres(candidateGenres: string[], availableGenres: Set<s
   }
 
   return accepted;
+}
+
+function buildSearchTrackQuery(input: { artistName?: string; genre?: string; year?: number }): string {
+  const parts: string[] = [];
+
+  if (input.artistName) {
+    parts.push(`artist:"${input.artistName}"`);
+  }
+
+  if (input.genre) {
+    parts.push(`genre:"${input.genre}"`);
+  }
+
+  if (input.year) {
+    parts.push(`year:${input.year}`);
+  }
+
+  if (parts.length === 0) {
+    return "";
+  }
+
+  return parts.join(" ");
+}
+
+async function searchTracks(userId: string, query: string, limit = 20): Promise<SpotifyTrack[]> {
+  if (!query.trim()) {
+    return [];
+  }
+
+  const params = new URLSearchParams({
+    q: query,
+    type: "track",
+    limit: String(limit),
+    market: "US",
+  });
+
+  const response = await spotifyRequest<SpotifySearchTracksResponse>(
+    userId,
+    `/search?${params.toString()}`,
+    undefined,
+    { maxRetries: 3 },
+  );
+
+  return response.tracks.items ?? [];
+}
+
+async function fetchFallbackSearchCandidates(
+  userId: string,
+  seedArtistNames: string[],
+  seedGenres: string[],
+): Promise<SpotifyTrack[]> {
+  const tracks: SpotifyTrack[] = [];
+
+  const safeArtistNames = dedupeStrings(seedArtistNames).slice(0, 4);
+  for (const artistName of safeArtistNames) {
+    try {
+      const query = buildSearchTrackQuery({ artistName });
+      tracks.push(...(await searchTracks(userId, query, 20)));
+    } catch (error) {
+      if (error instanceof SpotifyApiError && error.status >= 400 && error.status < 500) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  const safeGenres = dedupeStrings(seedGenres).slice(0, 4);
+  for (const genre of safeGenres) {
+    try {
+      const query = buildSearchTrackQuery({ genre });
+      tracks.push(...(await searchTracks(userId, query, 20)));
+    } catch (error) {
+      if (error instanceof SpotifyApiError && error.status >= 400 && error.status < 500) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  if (tracks.length === 0) {
+    const currentYear = new Date().getFullYear();
+    for (const year of [currentYear, currentYear - 1]) {
+      try {
+        const query = buildSearchTrackQuery({ year });
+        tracks.push(...(await searchTracks(userId, query, 25)));
+      } catch (error) {
+        if (error instanceof SpotifyApiError && error.status >= 400 && error.status < 500) {
+          continue;
+        }
+
+        throw error;
+      }
+    }
+  }
+
+  return dedupeTracksById(tracks);
 }
 
 function topValuesByFrequency(values: string[], maxSize: number): string[] {
@@ -328,10 +463,15 @@ async function fetchRecommendationCandidates(
   profile: TasteProfile,
   seedTracks: string[],
   seedArtists: string[],
+  seedArtistNames: string[],
   seedGenres: string[],
 ): Promise<SpotifyTrack[]> {
-  const seedTrackIds = dedupeStrings(seedTracks).slice(0, MAX_SEEDS_PER_REQUEST);
-  const seedArtistIds = dedupeStrings(seedArtists).slice(0, MAX_SEEDS_PER_REQUEST);
+  const seedTrackIds = dedupeStrings(seedTracks)
+    .filter((seedId) => isSpotifyEntityId(seedId))
+    .slice(0, MAX_SEEDS_PER_REQUEST);
+  const seedArtistIds = dedupeStrings(seedArtists)
+    .filter((seedId) => isSpotifyEntityId(seedId))
+    .slice(0, MAX_SEEDS_PER_REQUEST);
 
   if (seedTrackIds.length + seedArtistIds.length === 0 && seedGenres.length === 0) {
     throw new Error("Not enough listening data to generate recommendations yet.");
@@ -427,6 +567,11 @@ async function fetchRecommendationCandidates(
 
       throw error;
     }
+  }
+
+  const fallbackTracks = await fetchFallbackSearchCandidates(userId, seedArtistNames, seedGenres);
+  if (fallbackTracks.length > 0) {
+    return fallbackTracks;
   }
 
   if (lastClientError) {
@@ -578,6 +723,7 @@ export async function generateDailyRecommendations(
 
   const seedTrackIds = dedupeStrings([...taste.seedTrackIds, ...fallbackSeeds.seedTrackIds]).slice(0, 5);
   const seedArtistIds = dedupeStrings([...taste.seedArtistIds, ...fallbackSeeds.seedArtistIds]).slice(0, 5);
+  const seedArtistNames = dedupeStrings(taste.seedArtistNames).slice(0, 5);
   const seedGenres = taste.seedGenres.length ? taste.seedGenres : await getFallbackGenresFromArtists(seedArtistIds);
 
   const candidates = await fetchRecommendationCandidates(
@@ -585,6 +731,7 @@ export async function generateDailyRecommendations(
     taste.profile,
     seedTrackIds,
     seedArtistIds,
+    seedArtistNames,
     seedGenres,
   );
 
@@ -662,6 +809,7 @@ export async function generateDailyRecommendations(
     seeds: {
       tracks: seedTrackIds,
       artists: seedArtistIds,
+      artistNames: seedArtistNames,
       genres: seedGenres,
     },
     profile: taste.profile,
