@@ -31,6 +31,8 @@ export function ImportExportClient() {
   const [importing, setImporting] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [restoreFiles, setRestoreFiles] = useState<File[]>([]);
+  const [restoreProgress, setRestoreProgress] = useState(0);
+  const [restoreStatusLabel, setRestoreStatusLabel] = useState("");
 
   const refreshStatus = useCallback(async () => {
     const response = await fetch("/api/import/status", { cache: "no-store" });
@@ -118,6 +120,8 @@ export function ImportExportClient() {
     }
 
     setRestoring(true);
+    setRestoreProgress(0);
+    setRestoreStatusLabel("Uploading...");
 
     try {
       const formData = new FormData();
@@ -125,15 +129,16 @@ export function ImportExportClient() {
         formData.append("files", file);
       });
 
-      const response = await fetch("/api/import/json", {
-        method: "POST",
-        body: formData,
+      const { status, body } = await uploadImportWithProgress(formData, (progress) => {
+        setRestoreProgress(progress);
       });
 
-      if (!response.ok) {
-        const error = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(error?.error ?? "Restore failed");
+      if (status < 200 || status >= 300) {
+        throw new Error(body?.error ?? "Restore failed");
       }
+
+      setRestoreProgress(100);
+      setRestoreStatusLabel("Import complete");
 
       toast({
         title: "JSON restore complete",
@@ -153,7 +158,58 @@ export function ImportExportClient() {
       });
     } finally {
       setRestoring(false);
+      setTimeout(() => {
+        setRestoreProgress(0);
+        setRestoreStatusLabel("");
+      }, 1200);
     }
+  };
+
+  const uploadImportWithProgress = (
+    formData: FormData,
+    onProgress: (value: number) => void,
+  ): Promise<{ status: number; body: { error?: string } | null }> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/import/json");
+      xhr.responseType = "text";
+
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable || event.total <= 0) {
+          return;
+        }
+
+        const percent = Math.min(99, Math.round((event.loaded / event.total) * 100));
+        onProgress(percent);
+        setRestoreStatusLabel(`Uploading... ${percent}%`);
+      };
+
+      xhr.upload.onload = () => {
+        onProgress(100);
+        setRestoreStatusLabel("Processing imported data...");
+      };
+
+      xhr.onerror = () => {
+        reject(new Error("Upload failed"));
+      };
+
+      xhr.onload = () => {
+        let parsedBody: { error?: string } | null = null;
+
+        try {
+          parsedBody = xhr.responseText ? (JSON.parse(xhr.responseText) as { error?: string }) : null;
+        } catch {
+          parsedBody = null;
+        }
+
+        resolve({
+          status: xhr.status,
+          body: parsedBody,
+        });
+      };
+
+      xhr.send(formData);
+    });
   };
 
   const exportQuery = useMemo(() => {
@@ -235,6 +291,22 @@ export function ImportExportClient() {
               MB)
             </p>
           ) : null}
+          {(restoring || restoreProgress > 0) && (
+            <div className="space-y-2">
+              <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                <div
+                  className="h-full rounded-full bg-[#1DB954] transition-all duration-300"
+                  style={{ width: `${restoreProgress}%` }}
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={restoreProgress}
+                  aria-label="JSON import progress"
+                />
+              </div>
+              <p className="text-xs text-zinc-400">{restoreStatusLabel || `Uploading... ${restoreProgress}%`}</p>
+            </div>
+          )}
           <Button onClick={startRestoreFromFile} disabled={restoreFiles.length === 0 || restoring}>
             {restoring ? "Importing file..." : "Import File"}
           </Button>
