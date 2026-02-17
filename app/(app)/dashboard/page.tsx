@@ -40,6 +40,7 @@ export default async function DashboardPage({
   const range = parseTimeRangeFromSearchParams(params);
   const stats = await getDashboardStats(user.id, range);
   const rangeQuery = buildRangeQuery(params);
+  const isAllTime = range.preset === "all";
 
   return (
     <div className="space-y-6">
@@ -47,7 +48,9 @@ export default async function DashboardPage({
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-white">Dashboard</h1>
           <p className="text-sm text-zinc-400">
-            Listening summary from {range.from.toLocaleDateString()} to {range.to.toLocaleDateString()}
+            {isAllTime
+              ? "Listening summary for all time"
+              : `Listening summary from ${range.from.toLocaleDateString()} to ${range.to.toLocaleDateString()}`}
           </p>
         </div>
         <Link href={`/api/export/pdf${rangeQuery}`} className="text-sm text-[#1ed760] hover:underline">

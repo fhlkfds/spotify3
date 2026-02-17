@@ -12,7 +12,9 @@ import {
   startOfYear,
 } from "date-fns";
 
-export type TimePreset = "today" | "week" | "month" | "year";
+const TIME_PRESETS = ["today", "week", "month", "year", "all"] as const;
+
+export type TimePreset = (typeof TIME_PRESETS)[number];
 
 export type TimeRange = {
   from: Date;
@@ -36,6 +38,8 @@ export function getPresetRange(preset: TimePreset): TimeRange {
       return { from: startOfMonth(now), to: endOfMonth(now), preset };
     case "year":
       return { from: startOfYear(now), to: endOfYear(now), preset };
+    case "all":
+      return { from: new Date(0), to: endOfToday(), preset };
     default:
       return { from: startOfMonth(now), to: endOfMonth(now), preset: "month" };
   }
@@ -48,8 +52,8 @@ export function parseTimeRangeFromSearchParams(
   const from = firstValue(input.from);
   const to = firstValue(input.to);
 
-  if (preset && ["today", "week", "month", "year"].includes(preset)) {
-    return getPresetRange(preset as TimePreset);
+  if (preset && isTimePreset(preset)) {
+    return getPresetRange(preset);
   }
 
   if (from && to) {
@@ -78,4 +82,8 @@ function firstValue(value: string | string[] | undefined): string | undefined {
   }
 
   return value;
+}
+
+function isTimePreset(value: string): value is TimePreset {
+  return TIME_PRESETS.some((preset) => preset === value);
 }

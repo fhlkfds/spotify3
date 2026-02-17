@@ -11,6 +11,7 @@ const PRESETS = [
   { value: "week", label: "This Week" },
   { value: "month", label: "This Month" },
   { value: "year", label: "This Year" },
+  { value: "all", label: "All Time" },
 ] as const;
 
 const STORAGE_KEY = "spotify_tracker_time_range";
