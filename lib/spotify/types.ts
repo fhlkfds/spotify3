@@ -64,3 +64,7 @@ export type SpotifyAudioFeaturesResponse = {
 export type SpotifyRecommendationsResponse = {
   tracks: SpotifyTrack[];
 };
+
+export type SpotifyRecommendationGenreSeedsResponse = {
+  genres: string[];
+};

@@ -37,7 +37,9 @@ function mapRecommendationError(error: unknown): { status: number; message: stri
   if (
     message.includes("No listening history") ||
     message.includes("Not enough listening data") ||
-    message.includes("No new tracks available")
+    message.includes("No new tracks available") ||
+    message.includes("Spotify could not generate recommendations") ||
+    message.includes("Spotify returned no recommendation candidates")
   ) {
     return { status: 400, message };
   }

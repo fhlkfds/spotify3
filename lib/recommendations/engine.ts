@@ -1,10 +1,11 @@
 import { aggregateForRange } from "@/lib/analytics/service";
 import type { TimeRange } from "@/lib/date-range";
 import { prisma } from "@/lib/prisma";
-import { spotifyRequest } from "@/lib/spotify/client";
+import { SpotifyApiError, spotifyRequest } from "@/lib/spotify/client";
 import type {
   SpotifyArtistsResponse,
   SpotifyAudioFeaturesResponse,
+  SpotifyRecommendationGenreSeedsResponse,
   SpotifyRecommendationsResponse,
   SpotifyTrack,
 } from "@/lib/spotify/types";
@@ -51,6 +52,7 @@ type CandidateWithScore = {
 };
 
 const REGENERATE_COOLDOWN_MS = 60 * 60 * 1000;
+const MAX_SEEDS_PER_REQUEST = 5;
 
 type ListenedSeedRow = {
   trackId: string;
@@ -58,6 +60,13 @@ type ListenedSeedRow = {
     albumId: string | null;
     artistIds: string[];
   };
+};
+
+type SeedRequest = {
+  seedTracks: string[];
+  seedArtists: string[];
+  seedGenres: string[];
+  label: string;
 };
 
 function dateOnlyUtc(input: Date): Date {
@@ -165,6 +174,114 @@ function dedupeStrings(values: string[]): string[] {
   return deduped;
 }
 
+function sanitizeGenreToken(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^\p{L}\p{N}\s-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function toGenreSeedCandidates(input: string): string[] {
+  const normalized = sanitizeGenreToken(input);
+  if (!normalized) {
+    return [];
+  }
+
+  const collapsed = normalized.replace(/\s+/g, "-");
+  const aliasCandidates: Record<string, string> = {
+    "hip hop": "hip-hop",
+    "hip-hop": "hip-hop",
+    "r and b": "r-n-b",
+    "rnb": "r-n-b",
+    "drum and bass": "drum-and-bass",
+    "k pop": "k-pop",
+  };
+
+  return dedupeStrings([normalized, collapsed, aliasCandidates[normalized] ?? ""]);
+}
+
+function clampSeedsToSpotifyLimit(seedRequest: SeedRequest): SeedRequest {
+  const tracks = seedRequest.seedTracks.slice(0, 2);
+  const artists = seedRequest.seedArtists.slice(0, 2);
+  const remaining = MAX_SEEDS_PER_REQUEST - tracks.length - artists.length;
+  const genres = remaining > 0 ? seedRequest.seedGenres.slice(0, remaining) : [];
+
+  return {
+    seedTracks: tracks,
+    seedArtists: artists,
+    seedGenres: genres,
+    label: seedRequest.label,
+  };
+}
+
+function hasAtLeastOneSeed(seedRequest: SeedRequest): boolean {
+  return seedRequest.seedTracks.length + seedRequest.seedArtists.length + seedRequest.seedGenres.length > 0;
+}
+
+function buildSeedStrategyKey(seedRequest: SeedRequest): string {
+  return [
+    seedRequest.seedTracks.join(","),
+    seedRequest.seedArtists.join(","),
+    seedRequest.seedGenres.join(","),
+  ].join("|");
+}
+
+function buildRecommendationRequestParams(profile: TasteProfile, seedRequest: SeedRequest): URLSearchParams {
+  const params = new URLSearchParams({
+    limit: "100",
+    target_energy: String(profile.energy),
+    target_danceability: String(profile.danceability),
+    target_valence: String(profile.valence),
+    target_tempo: String(profile.tempo),
+  });
+
+  if (seedRequest.seedTracks.length > 0) {
+    params.set("seed_tracks", seedRequest.seedTracks.join(","));
+  }
+
+  if (seedRequest.seedArtists.length > 0) {
+    params.set("seed_artists", seedRequest.seedArtists.join(","));
+  }
+
+  if (seedRequest.seedGenres.length > 0) {
+    params.set("seed_genres", seedRequest.seedGenres.join(","));
+  }
+
+  return params;
+}
+
+async function getAvailableGenreSeeds(userId: string): Promise<Set<string>> {
+  const response = await spotifyRequest<SpotifyRecommendationGenreSeedsResponse>(
+    userId,
+    "/recommendations/available-genre-seeds",
+    undefined,
+    { maxRetries: 3 },
+  );
+
+  return new Set(response.genres.map((genre) => genre.toLowerCase()));
+}
+
+function filterSupportedGenres(candidateGenres: string[], availableGenres: Set<string>): string[] {
+  const accepted: string[] = [];
+  const seen = new Set<string>();
+
+  for (const genre of candidateGenres) {
+    const alternatives = toGenreSeedCandidates(genre);
+    const match = alternatives.find((candidate) => availableGenres.has(candidate));
+    if (!match || seen.has(match)) {
+      continue;
+    }
+
+    seen.add(match);
+    accepted.push(match);
+  }
+
+  return accepted;
+}
+
 function topValuesByFrequency(values: string[], maxSize: number): string[] {
   const counts = new Map<string, number>();
   for (const value of values) {
@@ -213,46 +330,110 @@ async function fetchRecommendationCandidates(
   seedArtists: string[],
   seedGenres: string[],
 ): Promise<SpotifyTrack[]> {
-  const seedTrackIds = dedupeStrings(seedTracks).slice(0, 2);
-  const seedArtistIds = dedupeStrings(seedArtists).slice(0, 2);
-  const seedGenreValues = dedupeStrings(seedGenres).slice(0, 1);
+  const seedTrackIds = dedupeStrings(seedTracks).slice(0, MAX_SEEDS_PER_REQUEST);
+  const seedArtistIds = dedupeStrings(seedArtists).slice(0, MAX_SEEDS_PER_REQUEST);
 
-  if (seedTrackIds.length + seedArtistIds.length + seedGenreValues.length === 0) {
+  if (seedTrackIds.length + seedArtistIds.length === 0 && seedGenres.length === 0) {
     throw new Error("Not enough listening data to generate recommendations yet.");
   }
 
-  const params = new URLSearchParams({
-    limit: "100",
-    target_energy: String(profile.energy),
-    target_danceability: String(profile.danceability),
-    target_valence: String(profile.valence),
-    target_tempo: String(profile.tempo),
-  });
+  let availableGenres = new Set<string>();
+  try {
+    availableGenres = await getAvailableGenreSeeds(userId);
+  } catch (error) {
+    if (!(error instanceof SpotifyApiError)) {
+      throw error;
+    }
 
-  if (seedTrackIds.length > 0) {
-    params.set("seed_tracks", seedTrackIds.join(","));
+    if (error.status === 401 || error.status >= 500) {
+      throw error;
+    }
   }
 
-  if (seedArtistIds.length > 0) {
-    params.set("seed_artists", seedArtistIds.join(","));
-  }
-
-  if (seedGenreValues.length > 0) {
-    params.set("seed_genres", seedGenreValues.join(","));
-  }
-
-  const response = await spotifyRequest<SpotifyRecommendationsResponse>(
-    userId,
-    `/recommendations?${params.toString()}`,
-    undefined,
-    { maxRetries: 5 },
+  const supportedSeedGenres = filterSupportedGenres(seedGenres, availableGenres).slice(
+    0,
+    MAX_SEEDS_PER_REQUEST,
   );
 
-  if (response.tracks.length === 0) {
-    throw new Error("Spotify returned no recommendation candidates for your profile.");
+  const requestedStrategies: SeedRequest[] = [
+    {
+      seedTracks: seedTrackIds,
+      seedArtists: seedArtistIds,
+      seedGenres: supportedSeedGenres,
+      label: "tracks+artists+genres",
+    },
+    {
+      seedTracks: seedTrackIds,
+      seedArtists: seedArtistIds,
+      seedGenres: [],
+      label: "tracks+artists",
+    },
+    {
+      seedTracks: seedTrackIds,
+      seedArtists: [],
+      seedGenres: [],
+      label: "tracks-only",
+    },
+    {
+      seedTracks: [],
+      seedArtists: seedArtistIds,
+      seedGenres: [],
+      label: "artists-only",
+    },
+  ];
+
+  const strategies: SeedRequest[] = [];
+  const strategyKeys = new Set<string>();
+  for (const strategy of requestedStrategies) {
+    const constrained = clampSeedsToSpotifyLimit(strategy);
+    if (!hasAtLeastOneSeed(constrained)) {
+      continue;
+    }
+
+    const key = buildSeedStrategyKey(constrained);
+    if (strategyKeys.has(key)) {
+      continue;
+    }
+
+    strategyKeys.add(key);
+    strategies.push(constrained);
   }
 
-  return response.tracks;
+  if (strategies.length === 0) {
+    throw new Error("Not enough listening data to generate recommendations yet.");
+  }
+
+  let lastClientError: SpotifyApiError | null = null;
+
+  for (const strategy of strategies) {
+    const params = buildRecommendationRequestParams(profile, strategy);
+
+    try {
+      const response = await spotifyRequest<SpotifyRecommendationsResponse>(
+        userId,
+        `/recommendations?${params.toString()}`,
+        undefined,
+        { maxRetries: 5 },
+      );
+
+      if (response.tracks.length > 0) {
+        return response.tracks;
+      }
+    } catch (error) {
+      if (error instanceof SpotifyApiError && error.status >= 400 && error.status < 500) {
+        lastClientError = error;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  if (lastClientError) {
+    throw new Error("Spotify could not generate recommendations from available seed combinations.");
+  }
+
+  throw new Error("Spotify returned no recommendation candidates for your profile.");
 }
 
 async function getAudioFeatureMap(
