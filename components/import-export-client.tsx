@@ -24,6 +24,33 @@ type ImportStatusResponse = {
 };
 
 const MAX_JSON_IMPORT_BYTES = 200 * 1024 * 1024;
+const JSON_IMPORT_TIMEOUT_MS = 12 * 60 * 1000;
+
+function formatImportFailureMessage(
+  status: number,
+  body: { error?: string } | null,
+  rawText: string,
+): string {
+  if (body?.error) {
+    return body.error;
+  }
+
+  if (status === 413) {
+    return "Import file too large. Maximum size is 200MB.";
+  }
+
+  if (status === 502 || status === 504) {
+    return `Import failed with HTTP ${status} (gateway timeout). Try splitting the JSON into smaller files and retry.`;
+  }
+
+  const compactText = rawText.replace(/\s+/g, " ").trim();
+  if (compactText.length > 0) {
+    const summary = compactText.slice(0, 180);
+    return `Import failed (HTTP ${status}): ${summary}${compactText.length > 180 ? "..." : ""}`;
+  }
+
+  return `Import failed (HTTP ${status}).`;
+}
 
 export function ImportExportClient() {
   const [status, setStatus] = useState<ImportStatusResponse | null>(null);
@@ -122,6 +149,7 @@ export function ImportExportClient() {
     setRestoring(true);
     setRestoreProgress(0);
     setRestoreStatusLabel("Uploading...");
+    let restoreSucceeded = false;
 
     try {
       const formData = new FormData();
@@ -129,16 +157,17 @@ export function ImportExportClient() {
         formData.append("files", file);
       });
 
-      const { status, body } = await uploadImportWithProgress(formData, (progress) => {
+      const { status, body, rawText } = await uploadImportWithProgress(formData, (progress) => {
         setRestoreProgress(progress);
       });
 
       if (status < 200 || status >= 300) {
-        throw new Error(body?.error ?? "Restore failed");
+        throw new Error(formatImportFailureMessage(status, body, rawText));
       }
 
       setRestoreProgress(100);
       setRestoreStatusLabel("Import complete");
+      restoreSucceeded = true;
 
       toast({
         title: "JSON restore complete",
@@ -151,53 +180,72 @@ export function ImportExportClient() {
       await refreshStatus();
       setRestoreFiles([]);
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Invalid file";
+      setRestoreStatusLabel(`Import failed: ${message}`);
+      setRestoreProgress(0);
       toast({
         title: "JSON restore failed",
-        description: error instanceof Error ? error.message : "Invalid file",
+        description: message,
         variant: "destructive",
       });
     } finally {
       setRestoring(false);
-      setTimeout(() => {
-        setRestoreProgress(0);
-        setRestoreStatusLabel("");
-      }, 1200);
+      if (restoreSucceeded) {
+        setTimeout(() => {
+          setRestoreProgress(0);
+          setRestoreStatusLabel("");
+        }, 1200);
+      }
     }
   };
 
   const uploadImportWithProgress = (
     formData: FormData,
     onProgress: (value: number) => void,
-  ): Promise<{ status: number; body: { error?: string } | null }> => {
+  ): Promise<{ status: number; body: { error?: string } | null; rawText: string }> => {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", "/api/import/json");
       xhr.responseType = "text";
+      xhr.timeout = JSON_IMPORT_TIMEOUT_MS;
 
       xhr.upload.onprogress = (event) => {
         if (!event.lengthComputable || event.total <= 0) {
           return;
         }
 
-        const percent = Math.min(99, Math.round((event.loaded / event.total) * 100));
+        const percent = Math.min(95, Math.round((event.loaded / event.total) * 95));
         onProgress(percent);
         setRestoreStatusLabel(`Uploading... ${percent}%`);
       };
 
-      xhr.upload.onload = () => {
-        onProgress(100);
-        setRestoreStatusLabel("Processing imported data...");
+      xhr.upload.onloadend = () => {
+        onProgress(99);
+        setRestoreStatusLabel("Upload complete. Processing imported data...");
       };
 
       xhr.onerror = () => {
-        reject(new Error("Upload failed"));
+        reject(new Error("Network error while uploading import file."));
+      };
+
+      xhr.onabort = () => {
+        reject(new Error("Import request was cancelled before completion."));
+      };
+
+      xhr.ontimeout = () => {
+        reject(
+          new Error(
+            "Import timed out while the server was processing your file. Try smaller files and retry.",
+          ),
+        );
       };
 
       xhr.onload = () => {
         let parsedBody: { error?: string } | null = null;
+        const rawText = xhr.responseText ?? "";
 
         try {
-          parsedBody = xhr.responseText ? (JSON.parse(xhr.responseText) as { error?: string }) : null;
+          parsedBody = rawText ? (JSON.parse(rawText) as { error?: string }) : null;
         } catch {
           parsedBody = null;
         }
@@ -205,6 +253,7 @@ export function ImportExportClient() {
         resolve({
           status: xhr.status,
           body: parsedBody,
+          rawText,
         });
       };
 

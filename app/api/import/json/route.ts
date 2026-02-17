@@ -12,6 +12,9 @@ export const runtime = "nodejs";
 const MAX_JSON_IMPORT_BYTES = 200 * 1024 * 1024;
 const MIN_MS_PLAYED = 30 * 1000;
 const SPOTIFY_TRACK_ID_REGEX = /^[A-Za-z0-9]{22}$/;
+const LOOKUP_BATCH_SIZE = 500;
+const CREATE_BATCH_SIZE = 500;
+const PLAY_BATCH_SIZE = 2_000;
 
 const restoreSchema = z.object({
   albums: z
@@ -95,6 +98,21 @@ type SpotifySearchTracksResponse = {
   };
 };
 
+type NormalizedTrackRow = {
+  id: string;
+  name: string;
+  durationMs: number;
+  albumId: string | null;
+  artistIds: string[];
+  popularity: number | null;
+  previewUrl: string | null;
+  imageUrl: string | null;
+  danceability: number | null;
+  energy: number | null;
+  valence: number | null;
+  tempo: number | null;
+};
+
 class RequestTooLargeError extends Error {}
 class UnsupportedImportFormatError extends Error {}
 
@@ -141,6 +159,62 @@ function mergeRawPayloads(payloads: unknown[]): unknown {
   }
 
   throw new UnsupportedImportFormatError("Mixed JSON file formats are not supported");
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  if (size <= 0) {
+    return [items];
+  }
+
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function dedupeById<T extends { id: string }>(items: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const item of items) {
+    map.set(item.id, item);
+  }
+  return [...map.values()];
+}
+
+async function fetchExistingIds(
+  ids: string[],
+  finder: (chunk: string[]) => Promise<Array<{ id: string }>>,
+): Promise<Set<string>> {
+  const existing = new Set<string>();
+  if (ids.length === 0) {
+    return existing;
+  }
+
+  const uniqueIds = [...new Set(ids)];
+  for (const chunk of chunkArray(uniqueIds, LOOKUP_BATCH_SIZE)) {
+    const rows = await finder(chunk);
+    for (const row of rows) {
+      existing.add(row.id);
+    }
+  }
+
+  return existing;
+}
+
+function formatPrismaImportError(error: Prisma.PrismaClientKnownRequestError): string {
+  if (error.code === "P2003") {
+    return "Import failed due to missing related records (track/artist/album).";
+  }
+
+  if (error.code === "P2024") {
+    return "Import failed because the database timed out. Try importing a smaller file.";
+  }
+
+  if (error.code === "P2028") {
+    return "Import transaction failed. Please retry.";
+  }
+
+  return "Import failed while writing data to the database.";
 }
 
 async function readImportPayload(request: NextRequest): Promise<unknown> {
@@ -536,127 +610,201 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   try {
-    for (const album of data.albums) {
-      await prisma.album.upsert({
-        where: { id: album.id },
-        update: {
-          name: album.name,
-          releaseDate: album.releaseDate ?? null,
-          imageUrl: album.imageUrl ?? null,
-        },
-        create: {
-          id: album.id,
-          name: album.name,
-          releaseDate: album.releaseDate ?? null,
-          imageUrl: album.imageUrl ?? null,
-        },
-      });
+    const uniqueAlbums = dedupeById(data.albums);
+    const uniqueArtists = dedupeById(data.artists);
+    const uniqueTracks = dedupeById(data.tracks);
+
+    const albumIdSet = new Set(uniqueAlbums.map((album) => album.id));
+    const referencedAlbumIds = [
+      ...new Set(
+        uniqueTracks
+          .map((track) => track.albumId)
+          .filter((albumId): albumId is string => typeof albumId === "string" && albumId.length > 0),
+      ),
+    ];
+    const missingAlbumIds = referencedAlbumIds.filter((albumId) => !albumIdSet.has(albumId));
+    const existingAlbumIds = await fetchExistingIds(missingAlbumIds, (chunk) =>
+      prisma.album.findMany({
+        where: { id: { in: chunk } },
+        select: { id: true },
+      }),
+    );
+    for (const albumId of existingAlbumIds) {
+      albumIdSet.add(albumId);
     }
 
-    for (const artist of data.artists) {
-      await prisma.artist.upsert({
-        where: { id: artist.id },
-        update: {
-          name: artist.name,
-          imageUrl: artist.imageUrl ?? null,
-          genres: artist.genres,
-        },
-        create: {
-          id: artist.id,
-          name: artist.name,
-          imageUrl: artist.imageUrl ?? null,
-          genres: artist.genres,
-        },
-      });
+    const artistIdSet = new Set(uniqueArtists.map((artist) => artist.id));
+    const referencedArtistIds = [...new Set(uniqueTracks.flatMap((track) => track.artistIds))];
+    const missingArtistIds = referencedArtistIds.filter((artistId) => !artistIdSet.has(artistId));
+    const existingArtistIds = await fetchExistingIds(missingArtistIds, (chunk) =>
+      prisma.artist.findMany({
+        where: { id: { in: chunk } },
+        select: { id: true },
+      }),
+    );
+    for (const artistId of existingArtistIds) {
+      artistIdSet.add(artistId);
     }
 
-    for (const track of data.tracks) {
-      await prisma.track.upsert({
-        where: { id: track.id },
-        update: {
-          name: track.name,
-          durationMs: track.durationMs,
-          albumId: track.albumId ?? null,
-          artistIds: track.artistIds,
-          popularity: track.popularity ?? null,
-          previewUrl: track.previewUrl ?? null,
-          imageUrl: track.imageUrl ?? null,
-          danceability: track.danceability ?? null,
-          energy: track.energy ?? null,
-          valence: track.valence ?? null,
-          tempo: track.tempo ?? null,
-        },
-        create: {
-          id: track.id,
-          name: track.name,
-          durationMs: track.durationMs,
-          albumId: track.albumId ?? null,
-          artistIds: track.artistIds,
-          popularity: track.popularity ?? null,
-          previewUrl: track.previewUrl ?? null,
-          imageUrl: track.imageUrl ?? null,
-          danceability: track.danceability ?? null,
-          energy: track.energy ?? null,
-          valence: track.valence ?? null,
-          tempo: track.tempo ?? null,
-        },
-      });
+    const trackRows: NormalizedTrackRow[] = uniqueTracks.map((track) => {
+      const validArtistIds = [...new Set(track.artistIds.filter((artistId) => artistIdSet.has(artistId)))];
+      const validAlbumId = track.albumId && albumIdSet.has(track.albumId) ? track.albumId : null;
 
+      return {
+        id: track.id,
+        name: track.name,
+        durationMs: Math.max(1, Math.round(track.durationMs)),
+        albumId: validAlbumId,
+        artistIds: validArtistIds,
+        popularity: track.popularity ?? null,
+        previewUrl: track.previewUrl ?? null,
+        imageUrl: track.imageUrl ?? null,
+        danceability: track.danceability ?? null,
+        energy: track.energy ?? null,
+        valence: track.valence ?? null,
+        tempo: track.tempo ?? null,
+      };
+    });
+
+    const trackArtistMap = new Map<string, Prisma.TrackArtistCreateManyInput>();
+    for (const track of trackRows) {
       for (const artistId of track.artistIds) {
-        await prisma.trackArtist.upsert({
-          where: {
-            trackId_artistId: {
-              trackId: track.id,
-              artistId,
-            },
-          },
-          update: {},
-          create: {
-            trackId: track.id,
-            artistId,
-          },
+        trackArtistMap.set(`${track.id}:${artistId}`, {
+          trackId: track.id,
+          artistId,
         });
       }
     }
+    const trackArtistRows = [...trackArtistMap.values()];
 
-    const playRows: Prisma.PlayEventCreateManyInput[] = data.plays
-      .map((play) => {
-        const parsedDate = new Date(play.playedAt);
-        if (Number.isNaN(parsedDate.getTime())) {
-          return null;
-        }
+    const knownTrackIds = new Set(trackRows.map((track) => track.id));
+    const referencedPlayTrackIds = [...new Set(data.plays.map((play) => play.trackId))];
+    const missingPlayTrackIds = referencedPlayTrackIds.filter((trackId) => !knownTrackIds.has(trackId));
+    const existingTrackIds = await fetchExistingIds(missingPlayTrackIds, (chunk) =>
+      prisma.track.findMany({
+        where: { id: { in: chunk } },
+        select: { id: true },
+      }),
+    );
+    for (const trackId of existingTrackIds) {
+      knownTrackIds.add(trackId);
+    }
 
-        return {
-          userId: user.id,
-          trackId: play.trackId,
-          playedAt: parsedDate,
-          importSource: "json_restore",
-        } as Prisma.PlayEventCreateManyInput;
-      })
-      .filter((row): row is Prisma.PlayEventCreateManyInput => row !== null);
+    const playRows: Prisma.PlayEventCreateManyInput[] = [];
+    const uniquePlayKeys = new Set<string>();
+    for (const play of data.plays) {
+      if (!knownTrackIds.has(play.trackId)) {
+        continue;
+      }
 
-    const result = await prisma.playEvent.createMany({
-      data: playRows,
-      skipDuplicates: true,
-    });
+      const parsedDate = new Date(play.playedAt);
+      if (Number.isNaN(parsedDate.getTime())) {
+        continue;
+      }
 
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        lastImportAt: new Date(),
-        lastImportStatus: `JSON restore completed (${result.count} play events)`,
-      },
+      const playedAtIso = parsedDate.toISOString();
+      const uniqueKey = `${play.trackId}:${playedAtIso}`;
+      if (uniquePlayKeys.has(uniqueKey)) {
+        continue;
+      }
+
+      uniquePlayKeys.add(uniqueKey);
+      playRows.push({
+        userId: user.id,
+        trackId: play.trackId,
+        playedAt: parsedDate,
+        importSource: "json_restore",
+      });
+    }
+
+    let insertedPlayCount = 0;
+    await prisma.$transaction(async (transaction) => {
+      for (const chunk of chunkArray(uniqueAlbums, CREATE_BATCH_SIZE)) {
+        await transaction.album.createMany({
+          data: chunk.map((album) => ({
+            id: album.id,
+            name: album.name,
+            releaseDate: album.releaseDate ?? null,
+            imageUrl: album.imageUrl ?? null,
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      for (const chunk of chunkArray(uniqueArtists, CREATE_BATCH_SIZE)) {
+        await transaction.artist.createMany({
+          data: chunk.map((artist) => ({
+            id: artist.id,
+            name: artist.name,
+            imageUrl: artist.imageUrl ?? null,
+            genres: artist.genres,
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      for (const chunk of chunkArray(trackRows, CREATE_BATCH_SIZE)) {
+        await transaction.track.createMany({
+          data: chunk.map((track) => ({
+            id: track.id,
+            name: track.name,
+            durationMs: track.durationMs,
+            albumId: track.albumId,
+            artistIds: track.artistIds,
+            popularity: track.popularity,
+            previewUrl: track.previewUrl,
+            imageUrl: track.imageUrl,
+            danceability: track.danceability,
+            energy: track.energy,
+            valence: track.valence,
+            tempo: track.tempo,
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      for (const chunk of chunkArray(trackArtistRows, CREATE_BATCH_SIZE)) {
+        await transaction.trackArtist.createMany({
+          data: chunk,
+          skipDuplicates: true,
+        });
+      }
+
+      for (const chunk of chunkArray(playRows, PLAY_BATCH_SIZE)) {
+        const chunkResult = await transaction.playEvent.createMany({
+          data: chunk,
+          skipDuplicates: true,
+        });
+        insertedPlayCount += chunkResult.count;
+      }
+
+      await transaction.user.update({
+        where: { id: user.id },
+        data: {
+          lastImportAt: new Date(),
+          lastImportStatus: `JSON restore completed (${insertedPlayCount} play events)`,
+        },
+      });
     });
 
     return NextResponse.json({
       ok: true,
-      importedPlays: result.count,
-      importedTracks: data.tracks.length,
-      importedAlbums: data.albums.length,
-      importedArtists: data.artists.length,
+      importedPlays: insertedPlayCount,
+      importedTracks: trackRows.length,
+      importedAlbums: uniqueAlbums.length,
+      importedArtists: uniqueArtists.length,
+      skippedPlays: data.plays.length - playRows.length,
     });
   } catch (error) {
     console.error("JSON restore failed", error);
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      return NextResponse.json({ error: formatPrismaImportError(error) }, { status: 500 });
+    }
+
+    if (error instanceof Error && error.message) {
+      return NextResponse.json({ error: `Restore failed: ${error.message}` }, { status: 500 });
+    }
+
     return NextResponse.json({ error: "Restore failed" }, { status: 500 });
   }
 }
