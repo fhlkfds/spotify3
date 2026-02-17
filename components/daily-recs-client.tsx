@@ -8,7 +8,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/hooks/use-toast";
 import type { DailyRecommendations } from "@/lib/recommendations/engine";
 
-export function DailyRecsClient() {
+type DailyRecsClientProps = {
+  demoMode?: boolean;
+};
+
+export function DailyRecsClient({ demoMode = false }: DailyRecsClientProps) {
   const [data, setData] = useState<DailyRecommendations | null>(null);
   const [loading, setLoading] = useState(true);
   const [regenerating, setRegenerating] = useState(false);
@@ -18,7 +22,12 @@ export function DailyRecsClient() {
     let active = true;
 
     const run = async () => {
-      const response = await fetch("/api/recommendations/daily", {
+      const query = new URLSearchParams();
+      if (demoMode) {
+        query.set("demo", "1");
+      }
+      const suffix = query.toString();
+      const response = await fetch(`/api/recommendations/daily${suffix ? `?${suffix}` : ""}`, {
         cache: "no-store",
       });
 
@@ -54,11 +63,17 @@ export function DailyRecsClient() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [demoMode]);
 
   const regenerate = async () => {
     setRegenerating(true);
-    const response = await fetch("/api/recommendations/daily?force=1", {
+    const query = new URLSearchParams();
+    query.set("force", "1");
+    if (demoMode) {
+      query.set("demo", "1");
+    }
+
+    const response = await fetch(`/api/recommendations/daily?${query.toString()}`, {
       method: "POST",
     });
 
@@ -108,6 +123,7 @@ export function DailyRecsClient() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-zinc-400">
           {data.fromCache ? "Using cached run" : "Generated"} at {new Date(data.generatedAt).toLocaleString()}
+          {demoMode ? " (Demo Data)" : ""}
         </p>
         <Button onClick={regenerate} variant="secondary" disabled={regenerating}>
           {regenerating ? "Regenerating..." : "Regenerate"}
